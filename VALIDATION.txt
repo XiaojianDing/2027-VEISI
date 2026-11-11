@@ -1,0 +1,20 @@
+Validation performed on CPU, Python 3.12 / PyTorch 2.14.1+cpu.
+
+PASS: compileall for all delivered Python files.
+PASS: verify.py (four-loss backward; nonzero finite gradients in encoder,
+initializer, predictors and attention; held-out input exclusion; stopped
+held-out target gradient; finite-difference agreement through the unrolled
+energy gradients; no_grad inference; singleton inference; batch invariance;
+iteration changes the initial state; two-view forward; checkpoint roundtrip).
+
+PASS: supplied 100leaves MAT data: one pretraining batch and one joint batch
+with actual training CLI (batch_size=16), saving final checkpoint and history.
+Observed joint components: rec=0.00090986, fcl=2.70804310,
+cv=0.70663279, fit=0.69529074; total=4.11087656 (all coefficients=1).
+
+Full-dataset evaluation and checkpoint-loading CLI were exercised with
+KMeans n_init=1 solely as a smoke check; no benchmark-performance claim.
+Also exercised evaluation-enabled training and best_acc checkpoint creation.
+
+Not performed: full convergence training, GPU validation, multi-dataset
+benchmark, original-model comparison, hyperparameter optimization.

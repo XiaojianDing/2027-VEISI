@@ -1,0 +1,803 @@
+--- original/network.py
++++ modified/network.py
+@@ -40,104 +40,160 @@
+         return self.decoder(x)
+ 
+ 
+-# SCMVC Network
++class IterativeSemanticFusion(nn.Module):
++    """Unrolled robust latent inference; no pair matching or recursive averaging."""
++    def __init__(self, views, feature_dim, semantic_dim, steps=3,
++                 step_size=0.5, proximal=0.1, robust_c=1.0, hidden_dim=128):
++        super().__init__()
++        if views < 2 or steps < 0 or min(feature_dim, semantic_dim, hidden_dim) < 1:
++            raise ValueError("Need at least two views and nonnegative inference steps")
++        if step_size <= 0 or proximal < 0 or robust_c <= 0:
++            raise ValueError("Invalid inference hyperparameters")
++        self.views, self.feature_dim = views, feature_dim
++        self.steps, self.step_size = steps, step_size
++        self.proximal, self.robust_c = proximal, robust_c
++        self.initializer = nn.Sequential(nn.Linear(feature_dim, 256), nn.ReLU(),
++                                         nn.Linear(256, semantic_dim))
++        # Tanh is smooth, supporting differentiation through energy gradients.
++        self.predictors = nn.ModuleList([
++            nn.Sequential(nn.Linear(semantic_dim, hidden_dim), nn.Tanh(),
++                          nn.Linear(hidden_dim, feature_dim)) for _ in range(views)])
++
++    def targets(self, zs):
++        # RMS-scale normalized codes: squared error / d stays O(1), not O(1/d).
++        return [F.normalize(z, dim=1) * (self.feature_dim ** 0.5) for z in zs]
++
++    def robust_error(self, prediction, target):
++        squared = (prediction - target.detach()).square().mean(dim=1)
++        c2 = self.robust_c ** 2
++        return c2 * torch.log1p(squared / c2)
++
++    def energy(self, h, h0, targets, observed):
++        errors = [self.robust_error(self.predictors[v](h), targets[v])
++                  for v in observed]
++        fit = torch.stack(errors, dim=1).mean(dim=1)
++        anchor = 0.5 * self.proximal * (h - h0).square().sum(dim=1)
++        return fit + anchor
++
++    def forward(self, zs, observed=None):
++        if len(zs) != self.views:
++            raise ValueError("Unexpected number of views")
++        observed = tuple(range(self.views)) if observed is None else tuple(observed)
++        if not observed or len(set(observed)) != len(observed):
++            raise ValueError("Observed view indices must be nonempty and unique")
++        if any(v < 0 or v >= self.views for v in observed):
++            raise ValueError("Observed view index out of range")
++        differentiable = self.training and torch.is_grad_enabled()
++        # Evaluation still needs local first derivatives, including under no_grad.
++        with torch.enable_grad():
++            targets = self.targets(zs)
++            mean_observed = torch.stack([targets[v] for v in observed]).mean(dim=0)
++            h0 = self.initializer(mean_observed)
++            if not differentiable:
++                h0 = h0.detach()
++            h = h0 if differentiable else h0.clone().requires_grad_(True)
++            fixed_targets = [target.detach() for target in targets]
++            for _ in range(self.steps):
++                energy = self.energy(h, h0, fixed_targets, observed)
++                # Sum over samples: each update is independent of batch size.
++                gradient, = torch.autograd.grad(energy.sum(), h,
++                                                create_graph=differentiable)
++                h = h - self.step_size * gradient
++                if not differentiable:
++                    h = h.detach().requires_grad_(True)
++            return h if differentiable else h.detach()
++
++    def fit_loss(self, h, zs, predicted=None):
++        predicted = tuple(range(self.views)) if predicted is None else tuple(predicted)
++        targets = self.targets(zs)
++        return torch.stack([self.robust_error(self.predictors[v](h), targets[v]).mean()
++                            for v in predicted]).mean()
++
++
++class GlobalGuidedAttention(nn.Module):
++    """Persistent, trainable counterpart of the original batch-created MHA."""
++    def __init__(self, semantic_dim, num_heads=4):
++        super().__init__()
++        if semantic_dim % num_heads:
++            raise ValueError("high_feature_dim must be divisible by num_heads")
++        self.query = nn.Linear(semantic_dim, semantic_dim, bias=False)
++        self.attention = nn.MultiheadAttention(semantic_dim, num_heads,
++                                               batch_first=True, dropout=0.0)
++
++    def forward(self, rs, H):
++        keys = torch.stack(rs, dim=1)
++        _, weights = self.attention(self.query(H).unsqueeze(1), keys, keys)
++        # Retain original aggregation and second softmax, now with gradients.
++        return F.softmax(weights.mean(dim=(0, 1)), dim=0)
++
++
+ class Network(nn.Module):
+-    def __init__(self, view, input_size, feature_dim, high_feature_dim, device, lambda_score=0.5):
+-        super(Network, self).__init__()
+-        self.view = view
+-        self.device = device
+-        self.lambda_score = lambda_score
+-        self.encoders = nn.ModuleList([Encoder(input_size[v], feature_dim).to(device) for v in range(view)])
+-        self.decoders = nn.ModuleList([Decoder(input_size[v], feature_dim).to(device) for v in range(view)])
++    def __init__(self, view, input_size, feature_dim, high_feature_dim, device,
++                 lambda_score=0.5, inference_steps=3, inference_lr=0.5,
++                 proximal_lambda=0.1, robust_c=1.0, predictor_hidden=128,
++                 num_heads=4):
++        super().__init__()
++        self.view, self.device = view, device
++        # lambda_score accepted only for old constructor compatibility.
++        self.encoders = nn.ModuleList([Encoder(input_size[v], feature_dim)
++                                       for v in range(view)])
++        self.decoders = nn.ModuleList([Decoder(input_size[v], feature_dim)
++                                       for v in range(view)])
++        self.common_information_module = nn.Linear(feature_dim, high_feature_dim)
++        self.semantic_fusion = IterativeSemanticFusion(
++            view, feature_dim, high_feature_dim, inference_steps, inference_lr,
++            proximal_lambda, robust_c, predictor_hidden)
++        self.view_attention = GlobalGuidedAttention(high_feature_dim, num_heads)
++        self.to(device)
+ 
+-        # global features fusion layer
+-        self.feature_fusion_module = nn.Sequential(
+-            nn.Linear(feature_dim, 256),
+-            nn.ReLU(),
+-            nn.Linear(256, high_feature_dim)
+-        )
++    def encode(self, xs):
++        return [encoder(x) for encoder, x in zip(self.encoders, xs)]
+ 
+-        # view-consensus features learning layer
+-        self.common_information_module = nn.Sequential(
+-            nn.Linear(feature_dim, high_feature_dim)
+-        )
+-
+-        # 预测器用于互补性计算
+-        self.predictor = nn.Sequential(
+-            nn.Linear(feature_dim, feature_dim),
+-            nn.ReLU(),
+-            nn.Linear(feature_dim, feature_dim)
+-        )
+-
+-    def compute_similarity(self, z1, z2):
+-        z1 = normalize(z1, dim=1)
+-        z2 = normalize(z2, dim=1)
+-        return (z1 * z2).sum(dim=1).mean()
+-
+-    def compute_complementarity(self, z1, z2):
+-        pred = self.predictor(z1)
+-        mse = F.mse_loss(pred, z2, reduction='none').mean(dim=1)
+-        return -mse.mean()  # 互补性越强，MSE 越低，得分越高
+-
+-    def hierarchical_fusion(self, zs):
+-        zs = zs.copy()
+-        while len(zs) > 1:
+-            best_score = None
+-            best_pair = None
+-
+-            for i in range(len(zs)):
+-                for j in range(i + 1, len(zs)):
+-                    sim = self.compute_similarity(zs[i], zs[j])
+-                    comp = self.compute_complementarity(zs[i], zs[j])
+-                    score = self.lambda_score * sim + (1 - self.lambda_score) * comp
+-                    if best_score is None or score > best_score:
+-                        best_score = score
+-                        best_pair = (i, j)
+-
+-            i, j = best_pair
+-            fused = (zs[i] + zs[j]) / 2  # 可改为更复杂的融合
+-            new_zs = []
+-            for k in range(len(zs)):
+-                if k != i and k != j:
+-                    new_zs.append(zs[k])
+-            new_zs.append(fused)
+-            zs = new_zs
+-        return zs[0]
+-
+-    def feature_fusion(self, zs, zs_gradient):
+-        H = self.hierarchical_fusion(zs)
+-        H = self.feature_fusion_module(H)
+-        return normalize(H, dim=1)
++    def reconstruct(self, xs):
++        zs = self.encode(xs)
++        return [decoder(z) for decoder, z in zip(self.decoders, zs)], zs
+ 
+     def compute_fusion_weight(self, z1, z2):
+-        sim1 = torch.norm(z1, dim=1, keepdim=True)
+-        sim2 = torch.norm(z2, dim=1, keepdim=True)
+-        weight1 = sim1 / (sim1 + sim2 + 1e-8)
+-        weight2 = sim2 / (sim1 + sim2 + 1e-8)
+-        return weight1, weight2
++        norm1, norm2 = z1.norm(dim=1, keepdim=True), z2.norm(dim=1, keepdim=True)
++        denominator = norm1 + norm2 + 1e-8
++        return norm1 / denominator, norm2 / denominator
+ 
+     def fuse_views(self, zs):
+-        new_zs = []
++        fused = []
+         for i in range(self.view):
+             for j in range(i + 1, self.view):
+-                weight1, weight2 = self.compute_fusion_weight(zs[i], zs[j])
+-                new_z = weight1 * zs[i] + weight2 * zs[j]
+-                new_zs.append(new_z)
+-        return new_zs
++                w1, w2 = self.compute_fusion_weight(zs[i], zs[j])
++                fused.append(w1 * zs[i] + w2 * zs[j])
++        return fused
+ 
+-    def forward(self, xs, zs_gradient=True):
+-        rs, xrs, zs = [], [], []
+-        for v in range(self.view):
+-            x = xs[v]
+-            z = self.encoders[v](x)
+-            xr = self.decoders[v](z)
+-            r = normalize(self.common_information_module(z), dim=1)
+-            rs.append(r)
+-            zs.append(z)
+-            xrs.append(xr)
++    def feature_fusion(self, zs, zs_gradient=True):
++        inputs = zs if zs_gradient else [z.detach() for z in zs]
++        return normalize(self.semantic_fusion(inputs), dim=1)
+ 
+-        new_zs = self.fuse_views(zs)
+-        new_rs = [normalize(self.common_information_module(new_z), dim=1) for new_z in new_zs]
+-        H = self.feature_fusion(zs, zs_gradient)
+-
+-        return xrs, zs, rs, H, new_rs
++    def forward(self, xs, zs_gradient=True, return_aux=False, heldout_view=None):
++        xrs, zs = self.reconstruct(xs)
++        rs = [normalize(self.common_information_module(z), dim=1) for z in zs]
++        new_rs = [normalize(self.common_information_module(z), dim=1)
++                  for z in self.fuse_views(zs)]
++        inputs = zs if zs_gradient else [z.detach() for z in zs]
++        raw_H = self.semantic_fusion(inputs)
++        H = normalize(raw_H, dim=1)
++        output = (xrs, zs, rs, H, new_rs)
++        if not return_aux:
++            return output  # Original five-value forward interface preserved.
++        if not self.training or not torch.is_grad_enabled():
++            raise RuntimeError("Auxiliary training losses require train mode and gradients")
++        if heldout_view is None:
++            heldout_view = int(torch.randint(self.view, ()).item())
++        if not 0 <= heldout_view < self.view:
++            raise ValueError("Invalid held-out view")
++        observed = [v for v in range(self.view) if v != heldout_view]
++        # Held-out code is absent from BOTH initialization and inner energy.
++        masked_H = self.semantic_fusion(inputs, observed=observed)
++        aux = {
++            "fit": self.semantic_fusion.fit_loss(raw_H, inputs),
++            "cv": self.semantic_fusion.fit_loss(masked_H, inputs, [heldout_view]),
++            "heldout_view": heldout_view,
++            "pair_weights": self.view_attention(new_rs, H),
++        }
++        return output + (aux,)
+--- original/loss.py
++++ modified/loss.py
+@@ -1,25 +1,37 @@
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
++
+ 
+ class ContrastiveLoss(nn.Module):
+-    def __init__(self, batch_size, temperature, device):
+-        super(ContrastiveLoss, self).__init__()
+-        self.batch_size = batch_size
+-        self.temperature = temperature
+-        self.device = device
++    """Stable original negative-only objective, with optional standard InfoNCE."""
++    def __init__(self, batch_size=None, temperature=1.0, device=None, mode='legacy'):
++        super().__init__()
++        if temperature <= 0 or mode not in ('legacy', 'infonce'):
++            raise ValueError('Invalid contrastive settings')
++        self.temperature, self.mode = temperature, mode
+ 
+     def forward(self, h_i, h_j, weight=None):
+-        N =self.batch_size
+-        similarity_matrix = torch.matmul(h_i, h_j.T) / self.temperature
+-        positives = torch.diag(similarity_matrix)
+-        mask = torch.ones((N, N)).to(self.device)
+-        mask = mask.fill_diagonal_(0)
++        if h_i.shape != h_j.shape or h_i.shape[0] < 2:
++            raise ValueError('Contrastive loss needs matching shapes and at least two samples')
++        logits = h_i @ h_j.T / self.temperature
++        if self.mode == 'infonce':
++            loss = F.cross_entropy(logits, torch.arange(len(h_i), device=h_i.device))
++        else:
++            negatives = logits.masked_fill(torch.eye(len(h_i), device=h_i.device,
++                                                       dtype=torch.bool), float('-inf'))
++            loss = (torch.logsumexp(negatives, dim=1) - logits.diagonal()).mean()
++        return loss if weight is None else weight * loss
+ 
+-        nominator = torch.exp(positives)
+-        denominator = (mask.bool()) * torch.exp(similarity_matrix)
+ 
+-        loss_partial = -torch.log(nominator / torch.sum(denominator, dim=1))
+-        loss = torch.sum(loss_partial) / N
+-        # loss = weight * loss if weight is not None else loss
+-
+-        return loss
++def training_objective(model, xs, contrastive, alpha=1.0, beta=1.0, gamma=1.0,
++                       heldout_view=None):
++    xrs, zs, rs, H, new_rs, aux = model(xs, return_aux=True,
++                                      heldout_view=heldout_view)
++    rec = torch.stack([F.mse_loss(xr, x) for xr, x in zip(xrs, xs)]).mean()
++    fcl = sum(contrastive(H, r, aux['pair_weights'][p])
++              for p, r in enumerate(new_rs))
++    # No single-view cl loss; no outer proximal loss.
++    terms = {'rec': rec, 'fcl': fcl, 'cv': aux['cv'], 'fit': aux['fit']}
++    total = rec + alpha * fcl + beta * terms['cv'] + gamma * terms['fit']
++    return total, terms
+--- original/train.py
++++ modified/train.py
+@@ -1,194 +1,152 @@
+-import os
++import argparse
++import json
++from pathlib import Path
++import random
++import numpy as np
+ import torch
+-import numpy as np
+-import random
+-import argparse
++from torch.utils.data import DataLoader
+ from network import Network
++from loss import ContrastiveLoss, training_objective
++from dataloader import load_data
+ from metric import valid
+-from loss import ContrastiveLoss
+-from dataloader import load_data
+-import torch.nn.functional as F
+-
+-# 选择数据集
+-Dataname = 'Fashion'
+-parser = argparse.ArgumentParser(description='train')
+-parser.add_argument('--dataset', default=Dataname)
+-parser.add_argument('--batch_size', default=256, type=int)
+-parser.add_argument("--learning_rate", default=0.0003)
+-parser.add_argument("--weight_decay", default=0.)
+-parser.add_argument("--pre_epochs", default=2)
+-parser.add_argument("--con_epochs", default=5)
+-parser.add_argument("--feature_dim", default=64)
+-parser.add_argument("--high_feature_dim", default=20)
+-parser.add_argument("--temperature", default=1)
+-args = parser.parse_args()
+-
+-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+-
+-# 设置种子
+-def setup_seed(seed):
+-    torch.manual_seed(seed)
+-    torch.cuda.manual_seed_all(seed)
+-    np.random.seed(seed)
+-    random.seed(seed)
+-    torch.backends.cudnn.deterministic = True
+-# 加载数据
+-
+-if args.dataset == "MNIST-USPS":
+-    args.con_epochs = 50
+-    seed = 10
+-if args.dataset == "100leaves":
+-    args.con_epochs = 100
+-    seed = 10
+-if args.dataset == "BDGP":
+-    args.con_epochs = 8
+-    seed = 10
+-if args.dataset == "Fashion":
+-    args.con_epochs = 50
+-    seed = 10
+-if args.dataset == "Caltech-5V":
+-    args.con_epochs = 100
+-    seed = 1000000
+-if args.dataset == "Cifar10":
+-    args.con_epochs = 10
+-    seed = 10
+-if args.dataset == "Synthetic3d":
+-    args.con_epochs = 100
+-    seed = 100
+-
+-dataset, dims, view, data_size, class_num = load_data(args.dataset)
+-data_loader = torch.utils.data.DataLoader(
+-    dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+-)
+ 
+ 
+-# 计算视图的多头注意力权重
+-def compute_view_value(rs, H, view, num_heads=4):
+-    """
+-    使用多头注意力机制计算视图权重
+-    :param rs: 视图特征列表 (list of tensor) -> 每个视图的形状: (N, d_v)
+-    :param H: 全局特征 (N, d)
+-    :param view: 视图数 (int)
+-    :param num_heads: 多头数量
+-    :return: 归一化视图权重 (tensor) -> (view,)
+-    """
+-    device = H.device
+-    N, d = H.shape
+-    d_v = rs[0].shape[1]
+-
+-    # 创建多头注意力模块：我们使用 embed_dim = d_v
+-    mha = torch.nn.MultiheadAttention(embed_dim=d_v, num_heads=num_heads, batch_first=True).to(device)
+-
+-    # 将 H 映射为 (N, d_v)，作为 query
+-    W_q = torch.nn.Linear(d, d_v, bias=False).to(device)
+-    Q = W_q(H).unsqueeze(1)  # (N, 1, d_v)
+-
+-    # 将每个视图的 rs[v] 拼接成 (N, view, d_v) 作为 Key 和 Value
+-    K = torch.stack([rs[v] for v in range(view)], dim=1).to(device)  # (N, view, d_v)
+-    V = K  # Value 一般设为 Key
+-
+-    # 输入多头注意力模块：Q -> (N, 1, d_v), K/V -> (N, view, d_v)
+-    attn_output, attn_weights = mha(Q, K, V)  # attn_weights: (N, 1, view)
+-
+-    # 平均所有样本上的注意力权重 (N, 1, view) -> (view,)
+-    w = torch.mean(attn_weights, dim=(0, 1))  # 对 N 和 1 平均
+-
+-    # 归一化
+-    w = F.softmax(w, dim=0)
+-
+-    return w
+-
+-# 预训练
+-def pretrain(epoch):
+-    tot_loss = 0.
+-    criterion = torch.nn.MSELoss()
+-    for batch_idx, (xs, _, _) in enumerate(data_loader):
+-        for v in range(view):
+-            xs[v] = xs[v].to(device)
+-        optimizer.zero_grad()
+-        xrs, _, _, _,_= model(xs)
+-        loss_list = [criterion(xs[v], xrs[v]) for v in range(view)]
+-        loss = sum(loss_list)
+-        loss.backward()
+-        optimizer.step()
+-        tot_loss += loss.item()
+-    print(f'Epoch {epoch}, Loss: {tot_loss / len(data_loader):.6f}')
++def setup_seed(seed):
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++    torch.backends.cudnn.deterministic = True
++    torch.backends.cudnn.benchmark = False
+ 
+ 
+-# 对比训练
+-def contrastive_train(epoch):
+-    tot_loss = 0.
+-    mse = torch.nn.MSELoss()
+-    for batch_idx, (xs, _, _) in enumerate(data_loader):
+-        for v in range(view):
+-            xs[v] = xs[v].to(device)
+-        optimizer.zero_grad()
+-        xrs, zs, rs, H,new_rs = model(xs)
++def build_parser():
++    p = argparse.ArgumentParser(description='HGCD with iterative semantic inference')
++    p.add_argument('--dataset', default='100leaves')
++    p.add_argument('--batch_size', type=int, default=256)
++    p.add_argument('--learning_rate', type=float, default=0.0003)
++    p.add_argument('--weight_decay', type=float, default=0.0)
++    p.add_argument('--pre_epochs', type=int, default=2)
++    p.add_argument('--con_epochs', type=int, default=None)
++    p.add_argument('--feature_dim', type=int, default=64)
++    p.add_argument('--high_feature_dim', type=int, default=20)
++    p.add_argument('--temperature', type=float, default=1.0)
++    p.add_argument('--alpha', type=float, default=1.0)
++    p.add_argument('--beta', type=float, default=1.0)
++    p.add_argument('--gamma', type=float, default=1.0)
++    p.add_argument('--inference_steps', type=int, default=3)
++    p.add_argument('--inference_lr', type=float, default=0.5)
++    p.add_argument('--proximal_lambda', type=float, default=0.1)
++    p.add_argument('--robust_c', type=float, default=1.0)
++    p.add_argument('--predictor_hidden', type=int, default=128)
++    p.add_argument('--num_heads', type=int, default=4)
++    p.add_argument('--contrastive_mode', choices=['legacy', 'infonce'], default='legacy')
++    p.add_argument('--seed', type=int, default=None)
++    p.add_argument('--device', default='auto')
++    p.add_argument('--eval_every', type=int, default=1, help='0 disables label-based evaluation')
++    p.add_argument('--eval_batch_size', type=int, default=512)
++    p.add_argument('--kmeans_n_init', type=int, default=100)
++    p.add_argument('--grad_clip', type=float, default=5.0)
++    p.add_argument('--output_dir', default='models')
++    p.add_argument('--max_batches', type=int, default=0, help='Debug only; 0 uses all batches')
++    return p
+ 
+ 
+-        loss_list = []
++def main():
++    args = build_parser().parse_args()
++    if args.batch_size < 2 or args.pre_epochs < 0 or args.eval_every < 0 or args.max_batches < 0:
++        raise ValueError('Invalid batch size, epoch count, evaluation interval, or batch limit')
++    if min(args.alpha, args.beta, args.gamma) < 0:
++        raise ValueError('Loss coefficients must be nonnegative')
++    defaults = {'MNIST-USPS': 50, '100leaves': 100, 'BDGP': 8, 'Fashion': 50,
++                'Caltech-5V': 100, 'Cifar10': 10, 'Synthetic3d': 100}
++    if args.con_epochs is None:
++        args.con_epochs = defaults.get(args.dataset, 50)
++    if args.con_epochs < 0:
++        raise ValueError('con_epochs must be nonnegative')
++    if args.seed is None:
++        args.seed = {'Caltech-5V': 1000000, 'Synthetic3d': 100}.get(args.dataset, 10)
++    setup_seed(args.seed)
++    device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu')
++                          if args.device == 'auto' else args.device)
++    dataset, dims, view, data_size, class_num = load_data(args.dataset)
++    if len(dataset) < 2:
++        raise ValueError('Need at least two samples')
++    # Do not discard whole small datasets; skip singleton remainder for contrast.
++    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
++    config = dict(view=view, input_size=dims, feature_dim=args.feature_dim,
++                  high_feature_dim=args.high_feature_dim, inference_steps=args.inference_steps,
++                  inference_lr=args.inference_lr, proximal_lambda=args.proximal_lambda,
++                  robust_c=args.robust_c, predictor_hidden=args.predictor_hidden,
++                  num_heads=args.num_heads)
++    model = Network(device=device, **config)
++    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate,
++                                 weight_decay=args.weight_decay)
++    contrastive = ContrastiveLoss(temperature=args.temperature, mode=args.contrastive_mode)
++    out = Path(args.output_dir)
++    out.mkdir(parents=True, exist_ok=True)
++    history, best_acc = [], -1.0
+ 
+-        with torch.no_grad():
+-            w = compute_view_value(new_rs, H, len(new_rs))  # Use the number of fused views
++    def save(name, epoch):
++        torch.save({'model_state_dict': model.state_dict(), 'model_config': config,
++                    'args': vars(args), 'epoch': epoch, 'history': history,
++                    'optimizer_state_dict': optimizer.state_dict()}, out / name)
+ 
+-        for v in range(len(new_rs)):  # Iterate over fused views
+-            # Self-weighted contrastive learning loss
+-            loss_list.append(contrastiveloss(H, new_rs[v], w[v].item()))  # 取第一个值
++    for epoch in range(1, args.pre_epochs + args.con_epochs + 1):
++        model.train()
++        pretraining = epoch <= args.pre_epochs
++        totals = {'total': 0.0, 'rec': 0.0, 'fcl': 0.0, 'cv': 0.0, 'fit': 0.0}
++        count = 0
++        for xs, _, _ in loader:
++            xs = [x.to(device) for x in xs]
++            if not pretraining and xs[0].shape[0] < 2:
++                continue
++            optimizer.zero_grad(set_to_none=True)
++            if pretraining:
++                xrs, _ = model.reconstruct(xs)  # No unnecessary unrolled inference.
++                total = torch.stack([torch.nn.functional.mse_loss(a, b)
++                                     for a, b in zip(xrs, xs)]).mean()
++                terms = {'rec': total}
++            else:
++                total, terms = training_objective(model, xs, contrastive,
++                                                  args.alpha, args.beta, args.gamma)
++            if not torch.isfinite(total):
++                raise FloatingPointError('Nonfinite loss; reduce inference_lr or learning_rate')
++            total.backward()
++            if args.grad_clip > 0:
++                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip,
++                                               error_if_nonfinite=True)
++            optimizer.step()
++            totals['total'] += total.item()
++            for name, value in terms.items():
++                totals[name] += value.item()
++            count += 1
++            if args.max_batches and count >= args.max_batches:
++                break
++        if not count:
++            raise RuntimeError('No training batches')
++        row = {'epoch': epoch, 'phase': 'pretrain' if pretraining else 'joint',
++               **{name: value / count for name, value in totals.items()}}
++        print(json.dumps(row), flush=True)
++        if not pretraining and args.eval_every and (
++                (epoch - args.pre_epochs) % args.eval_every == 0 or
++                epoch == args.pre_epochs + args.con_epochs):
++            acc, nmi, pur = valid(model, device, dataset, view, data_size, class_num,
++                                  epoch=epoch, batch_size=args.eval_batch_size,
++                                  n_init=args.kmeans_n_init, random_state=args.seed)
++            row.update(acc=acc, nmi=nmi, pur=pur)
++            if acc > best_acc:
++                best_acc = acc
++                history.append(row)
++                save(f'{args.dataset}_best_acc.pth', epoch)
++                history.pop()
++        history.append(row)
++        save(f'{args.dataset}_last.pth', epoch)
++        (out / f'{args.dataset}_history.json').write_text(
++            json.dumps(history, indent=2), encoding='utf-8')
++    print('Saved final checkpoint; best_acc checkpoints use ground-truth evaluation labels.')
+ 
+ 
+-        for v in range(view):
+-            # 计算视图权重
+-            with torch.no_grad():
+-                w = compute_view_value(rs, H, view)
+-            loss_list.append(contrastiveloss(H, rs[v], w[v])) # 对比损失
+-            # loss_list.append(0.1*contrastiveloss(soft_labels_H,soft_labels_rs_tensor[v], w[v]))  # 标签对比损失
+-            loss_list.append(mse(xs[v], xrs[v]))  # 重构损失
+-        loss = sum(loss_list)
+-        loss.backward()
+-        optimizer.step()
+-        tot_loss += loss.item()
+-    print(f'Epoch {epoch}, Loss: {tot_loss / len(data_loader):.6f}')
+-    return tot_loss / len(data_loader)
+-
+-
+-# 训练与评估
+-accs, nmis, purs, losses = [], [], [], []
+-epoch_accuracies, epoch_nmis, epoch_losses = [], [], []
+-
+-if not os.path.exists('./models'):
+-    os.makedirs('./models')
+-
+-T = 1  # 训练轮次
+-for i in range(T):
+-    print(f"ROUND: {i + 1}")
+-    setup_seed(seed)
+-    model = Network(view, dims, args.feature_dim, args.high_feature_dim, device).to(device)
+-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+-    contrastiveloss = ContrastiveLoss(args.batch_size, args.temperature, device).to(device)
+-
+-    best_acc, best_nmi, best_pur = 0, 0, 0
+-    epoch = 1
+-
+-    # 预训练
+-    while epoch <= args.pre_epochs:
+-        pretrain(epoch)
+-        epoch += 1
+-
+-    # 对比训练
+-    while epoch <= args.pre_epochs + args.con_epochs:
+-        loss = contrastive_train(epoch)
+-        acc, nmi, pur = valid(model, device, dataset, view, data_size, class_num, eval_h=False, epoch=epoch)
+-        epoch_accuracies.append(acc)
+-        epoch_nmis.append(nmi)
+-        epoch_losses.append(loss)
+-
+-        if acc > best_acc:
+-            best_acc, best_nmi, best_pur = acc, nmi, pur
+-            torch.save(model.state_dict(), f'./models/{args.dataset}.pth')
+-        epoch += 1
+-
+-    accs.append(best_acc)
+-    nmis.append(best_nmi)
+-    purs.append(best_pur)
+-    print(f'The best clustering performance: ACC = {best_acc:.4f}, NMI = {best_nmi:.4f}, PUR = {best_pur:.4f}')
+-
++if __name__ == '__main__':
++    main()
+--- original/test.py
++++ modified/test.py
+@@ -1,37 +1,36 @@
++import argparse
+ import torch
+ from network import Network
+ from metric import valid
+-import argparse
+ from dataloader import load_data
+ 
+-# MNIST-USPS
+-# BDGP
+-# CCV
+-# Fashion
+-# Caltech-2V
+-# Caltech-3V
+-# Caltech-4V
+-# Caltech-5V
+-# Cifar10
+-# Cifar100
+-# Prokaryotic
+-# Synthetic3d
+-Dataname = 'MNIST-USPS'
+-parser = argparse.ArgumentParser(description='test')
+-parser.add_argument('--dataset', default=Dataname)
+-parser.add_argument("--feature_dim", default=64)
+-parser.add_argument("--hide_feature_dim", default=20)
+-args = parser.parse_args()
+-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+-dataset, dims, view, data_size, class_num = load_data(args.dataset)
+-model = Network(view, dims, args.feature_dim, args.hide_feature_dim, device)
+-model = model.to(device)
+ 
+-checkpoint = torch.load('./models/' + args.dataset + '.pth')
+-model.load_state_dict(checkpoint)
++def main():
++    parser = argparse.ArgumentParser(description='Evaluate saved VEISI checkpoint')
++    parser.add_argument('--checkpoint', required=True)
++    parser.add_argument('--dataset', default=None)
++    parser.add_argument('--batch_size', type=int, default=512)
++    parser.add_argument('--kmeans_n_init', type=int, default=100)
++    parser.add_argument('--device', default='auto')
++    parser.add_argument('--eval_views', action='store_true')
++    args = parser.parse_args()
++    device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu')
++                          if args.device == 'auto' else args.device)
++    # Saved payload contains only tensors and primitive containers.
++    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
++    if 'model_config' not in checkpoint:
++        raise ValueError('Original HGCD checkpoints are incompatible; retrain the new model')
++    name = args.dataset or checkpoint['args']['dataset']
++    dataset, dims, view, size, classes = load_data(name)
++    config = checkpoint['model_config']
++    if config['input_size'] != dims or config['view'] != view:
++        raise ValueError('Dataset dimensions differ from checkpoint')
++    model = Network(device=device, **config)
++    model.load_state_dict(checkpoint['model_state_dict'])
++    valid(model, device, dataset, view, size, classes, eval_h=args.eval_views,
++          batch_size=args.batch_size, n_init=args.kmeans_n_init,
++          random_state=checkpoint['args']['seed'])
+ 
+-model.eval()
+-print("Dataset:{}".format(args.dataset))
+-print("Datasize:" + str(data_size))
+-print("Loading models...")
+-acc, nmi, pur = valid(model, device, dataset, view, data_size, class_num, eval_h=True)
++
++if __name__ == '__main__':
++    main()
+--- original/metric.py
++++ modified/metric.py
+@@ -17,6 +17,7 @@
+     return sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
+ 
+ def purity(y_true, y_pred):
++    y_true = y_true.copy()
+     y_voted_labels = np.zeros(y_true.shape)
+     labels = np.unique(y_true)
+     ordered_labels = np.arange(labels.shape[0])
+@@ -39,46 +40,34 @@
+     pur = purity(label, pred)
+     return nmi, ari, acc, pur
+ 
+-def valid(model, device, dataset, view, data_size, class_num, eval_h=False, epoch=None):
+-    test_loader = DataLoader(
+-            dataset,
+-            batch_size=data_size,
+-            shuffle=False,
+-        )
+-    for batch_idx, (xs, y, _) in enumerate(test_loader):
+-        for v in range(view):
+-            xs[v] = xs[v].to(device)
+-    labels = y.cpu().detach().data.numpy().squeeze()
+-
+-    # inference
+-    with torch.no_grad():
+-        xrs, zs, rs, H ,_= model(xs)
+-
+-    if eval_h:
+-        print("Clustering results on low-level features of each view:")
+-        for v in range(view):
+-            kmeans = KMeans(n_clusters=class_num, n_init=100)
+-            y_pred = kmeans.fit_predict(zs[v].cpu().data.numpy())
+-            nmi, ari, acc, pur = evaluate(labels, y_pred)
+-            print('ACC{} = {:.4f} NMI{} = {:.4f} ARI{} = {:.4f} PUR{}={:.4f}'.format(v + 1, acc,
+-                                                                                     v + 1, nmi,
+-                                                                                     v + 1, ari,
+-                                                                                     v + 1, pur))
+-        print("Clustering results on view-consensus features of each view:")
+-        for v in range(view):
+-            y_pred = kmeans.fit_predict(rs[v].cpu().data.numpy())
+-            nmi, ari, acc, pur = evaluate(labels, y_pred)
+-            print('ACC{} = {:.4f} NMI{} = {:.4f} ARI{} = {:.4f} PUR{}={:.4f}'.format(v + 1, acc,
+-                                                                                     v + 1, nmi,
+-                                                                                     v + 1, ari,
+-                                                                                     v + 1, pur))
+-
+-    # Clustering results on global features
+-    kmeans = KMeans(n_clusters=class_num, n_init=100)
+-    y_pred = kmeans.fit_predict(H.cpu().data.numpy())
+-    nmi, ari, acc, pur = evaluate(labels, y_pred)
+-    if epoch is not None:
+-        print('Epoch {}'.format(epoch),'The clustering performace: ACC = {:.4f} NMI = {:.4f} ARI = {:.4f} PUR={:.4f}'.format(acc, nmi, ari, pur))
+-    else:
+-        print('The clustering performace: ACC = {:.4f} NMI = {:.4f} ARI = {:.4f} PUR={:.4f}'.format(acc, nmi, ari, pur))
+-    return acc, nmi, pur
++def valid(model, device, dataset, view, data_size, class_num, eval_h=False,
++          epoch=None, batch_size=512, n_init=100, random_state=10):
++    was_training = model.training
++    model.eval()
++    collected, labels, zparts, rparts = [], [], [[] for _ in range(view)], [[] for _ in range(view)]
++    try:
++        for xs, y, _ in DataLoader(dataset, batch_size=batch_size, shuffle=False):
++            xs = [x.to(device) for x in xs]
++            with torch.no_grad():
++                _, zs, rs, H, _ = model(xs)
++            collected.append(H.cpu().numpy())
++            labels.append(torch.as_tensor(y).cpu().numpy().reshape(-1))
++            if eval_h:
++                for v in range(view):
++                    zparts[v].append(zs[v].cpu().numpy())
++                    rparts[v].append(rs[v].cpu().numpy())
++        labels = np.concatenate(labels)
++        if eval_h:
++            for kind, parts in [('latent', zparts), ('local', rparts)]:
++                for v, batches in enumerate(parts):
++                    pred = KMeans(n_clusters=class_num, n_init=n_init,
++                                  random_state=random_state).fit_predict(np.concatenate(batches))
++                    nmi, ari, acc, pur = evaluate(labels, pred)
++                    print(f'{kind} view {v}: ACC={acc:.4f} NMI={nmi:.4f} PUR={pur:.4f}')
++        pred = KMeans(n_clusters=class_num, n_init=n_init,
++                      random_state=random_state).fit_predict(np.concatenate(collected))
++        nmi, ari, acc, pur = evaluate(labels, pred)
++        print(f'Epoch {epoch}: ACC={acc:.4f} NMI={nmi:.4f} ARI={ari:.4f} PUR={pur:.4f}')
++        return acc, nmi, pur
++    finally:
++        model.train(was_training)
